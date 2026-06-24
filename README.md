@@ -2,6 +2,10 @@
 
 A no-nonsense file encryption CLI tool written in Rust. 
 
+![Rust](https://img.shields.io/badge/Rust-1.89+-orange)
+![License](https://img.shields.io/badge/License-MIT-blue)
+![Status](https://img.shields.io/badge/Status-Active-green)
+
 No config files, no cloud sync, no backdoors. Just AES-256-GCM and Argon2id keeping your files safe.
 
 ## Why this exists
