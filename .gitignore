@@ -1,0 +1,4 @@
+/target
+*.enc
+*.swp
+.DS_Store
