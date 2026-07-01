@@ -66,10 +66,21 @@ encrpt encrypt -i secret.txt -o existing.enc --force
 ```
 
 ## Under the hood (File Format)
-The encrypted file is just a fixed header followed by the ciphertext. Keeping it simple means it's easy to parse and hard to mess up.
 
-Note: Because the Argon2 parameters are baked into the header, you can safely change the defaults in a future version of the tool and it will still be able to decrypt older files.
+The encrypted file is just a fixed 47-byte header followed by encrypted chunks. Keeping it simple means it's easy to parse and hard to mess up.
 
+| Offset | Size | Field                        |
+|--------|------|------------------------------|
+| 0      | 6    | Magic bytes `ENCRPT`         |
+| 6      | 1    | Format version (`0x02`)      |
+| 7      | 16   | Argon2id salt                |
+| 23     | 12   | AES-256-GCM base nonce       |
+| 35     | 4    | Argon2id m_cost (u32 BE)     |
+| 39     | 4    | Argon2id t_cost (u32 BE)     |
+| 43     | 4    | Argon2id p_cost (u32 BE)     |
+| 47     | ...  | Chunks: `[u32 len] [ciphertext + 16 byte tag]` |
+
+*Note: Because the Argon2 parameters are baked into the header, you can safely change the defaults in a future version of the tool and it will still be able to decrypt older files.*
 ## Security Notes
 - Don't forget your password. There is no recovery mechanism. If you lose it, the data is gone.
 
