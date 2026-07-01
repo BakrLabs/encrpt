@@ -1,10 +1,10 @@
 [package]
 name = "encrpt"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "A simple, secure file encryption CLI tool using AES-256-GCM and Argon2id"
 license = "MIT"
-repository = ""
+repository = "https://github.com/BakrLabs/encrpt"
 keywords = ["encryption", "aes-gcm", "argon2", "cli"]
 categories = ["command-line-utilities", "cryptography"]
 

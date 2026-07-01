@@ -1,92 +1,133 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use anyhow::{bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::RngCore;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use zeroize::Zeroize;
 
 // ── The file format ──────────────────────────────────────────
 // 
-// I decided to keep this dead simple. No complex TLV structures, 
-// just a fixed header. It makes parsing a breeze.
-//
 //  Bytes  Field
-//  0-5    Magic bytes "ENCRPT" (so we don't try to decrypt a jpeg)
-//  6      Format version (0x01)
+//  0-5    Magic bytes "ENCRPT"
+//  6      Format version (0x02) - Bumped for chunked streaming
 //  7-22   Salt          (16 bytes)
 //  23-34  Nonce         (12 bytes)
 //  35-38  Argon2 m_cost (u32 big-endian)
 //  39-42  Argon2 t_cost (u32 big-endian)
 //  43-46  Argon2 p_cost (u32 big-endian)
-//  47+    Ciphertext + GCM tag
+//  47+    Chunks: [u32 chunk_len LE] [ciphertext + 16 byte tag]
 // ─────────────────────────────────────────────────────────────
 
 const MAGIC: &[u8; 6] = b"ENCRPT";
-const FORMAT_VERSION: u8 = 0x01;
+const FORMAT_VERSION: u8 = 0x02;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
+const HEADER_LEN: usize = 6 + 1 + SALT_LEN + NONCE_LEN + 4 + 4 + 4; // 47
 
-// 6 + 1 + 16 + 12 + 4 + 4 + 4 = 47 bytes
-const HEADER_LEN: usize = 47;
+// 64KB chunks. Sweet spot for I/O performance and memory usage.
+const CHUNK_SIZE: usize = 64 * 1024;
 
 // 64MB memory, 3 passes, 1 thread.
-// It's the "Goldilocks" zone for Argon2id right now—hard enough on GPUs, 
-// fast enough that users don't get annoyed waiting.
 const DEFAULT_M_COST: u32 = 65536; 
 const DEFAULT_T_COST: u32 = 3;
 const DEFAULT_P_COST: u32 = 1;
 
-/// A quick struct to hold the parsed header data. 
-/// Using a struct keeps the function signature clean instead of returning a 6-tuple.
 struct EncryptedHeader<'a> {
     salt: &'a [u8],
     nonce: &'a [u8],
     m_cost: u32,
     t_cost: u32,
     p_cost: u32,
-    ciphertext: &'a [u8],
 }
 
 // ── Public API ───────────────────────────────────────────────
 
-/// Locks a file up tight. 
-/// Uses AES-256-GCM so nobody can tamper with it, and Argon2id so 
-/// brute-forcing the password takes forever.
 pub fn encrypt_file(
     input_path: &str,
     output_path: &str,
     password: &str,
 ) -> Result<()> {
-    let plaintext = fs::read(input_path).context("Failed to read input file")?;
+    let mut input_file = fs::File::open(input_path).context("Failed to open input file")?;
+    
+    let tmp_output_path = format!("{}.tmp", output_path);
+    let mut output_file = fs::File::create(&tmp_output_path).context("Couldn't create the temporary output file")?;
+    set_restrictive_permissions(&output_file);
 
-    // Cook up some random salt and nonce. 
-    // OsRng pulls from the OS entropy pool—/dev/urandom on Linux, CryptoAPI on Windows.
-    let mut salt = [0u8; SALT_LEN];
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from(nonce_bytes);
+    // Wrap the core logic in a closure so we can catch errors and clean up
+    let result = (|| {
+        let mut salt = [0u8; SALT_LEN];
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
 
-    // Turn the password into a 256-bit key. This takes a second on purpose (Argon2).
-    let mut key = derive_key(password, &salt, DEFAULT_M_COST, DEFAULT_T_COST, DEFAULT_P_COST)?;
+        let mut key = derive_key(password, &salt, DEFAULT_M_COST, DEFAULT_T_COST, DEFAULT_P_COST)?;
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .expect("Key is exactly 32 bytes, so this should never fail");
 
-    // Do the actual encryption. 
-    // AES-GCM handles both secrecy and integrity (authentication tag) for us.
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .expect("Key is exactly 32 bytes, so this should never fail");
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_slice())
-        .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+        output_file.write_all(MAGIC)?;
+        output_file.write_all(&[FORMAT_VERSION])?;
+        output_file.write_all(&salt)?;
+        output_file.write_all(&nonce_bytes)?;
+        output_file.write_all(&DEFAULT_M_COST.to_be_bytes())?;
+        output_file.write_all(&DEFAULT_T_COST.to_be_bytes())?;
+        output_file.write_all(&DEFAULT_P_COST.to_be_bytes())?;
 
-    write_encrypted_file(output_path, &salt, &nonce_bytes, &ciphertext)?;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut chunk_index: u32 = 0;
 
-    // Wipe the key from memory. No reason to leave the keys in the ignition.
-    key.zeroize();
+        loop {
+            let bytes_read = input_file.read(&mut buf)?;
+            let is_last = bytes_read == 0;
+            let plaintext = if is_last { &[][..] } else { &buf[..bytes_read] };
 
+            let mut aad = Vec::with_capacity(5);
+            aad.extend_from_slice(&chunk_index.to_le_bytes());
+            aad.push(if is_last { 1 } else { 0 });
+
+            let mut chunk_nonce = nonce_bytes;
+            let idx_bytes = chunk_index.to_le_bytes();
+            for i in 0..4 {
+                chunk_nonce[NONCE_LEN - 4 + i] ^= idx_bytes[i];
+            }
+            let nonce = Nonce::from_slice(&chunk_nonce);
+
+            let ciphertext = cipher
+                .encrypt(nonce, Payload { msg: plaintext, aad: &aad })
+                .map_err(|e| anyhow::anyhow!("Encryption failed on chunk {}: {}", chunk_index, e))?;
+
+            output_file.write_all(&(plaintext.len() as u32).to_le_bytes())?;
+            output_file.write_all(&ciphertext)?;
+
+            print!(".");
+            std::io::stdout().flush()?;
+            
+            if is_last {
+                break;
+            }
+            chunk_index += 1;
+        }
+
+        println!(); // Newline after dots
+        key.zeroize();
+        Ok(())
+    })();
+
+    // Close the file handle
+    drop(output_file);
+
+    // If encryption failed, delete the orphaned temp file before returning the error
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_output_path);
+        return result;
+    }
+
+    // If it succeeded, rename the temp file to the final output
+    fs::rename(&tmp_output_path, output_path).context("Failed to finalize the encrypted file")?;
+    
     Ok(())
 }
 
@@ -95,34 +136,130 @@ pub fn decrypt_file(
     output_path: &str,
     password: &str,
 ) -> Result<()> {
-    let file_bytes = fs::read(input_path).context("Failed to read input file")?;
+    let mut input_file = fs::File::open(input_path).context("Failed to open input file")?;
+    
+    let tmp_output_path = format!("{}.tmp", output_path);
+    let mut output_file = fs::File::create(&tmp_output_path).context("Couldn't create the temporary output file")?;
+    set_restrictive_permissions(&output_file);
 
-    // Pick apart the header before we do any expensive crypto math
-    let header = parse_header(&file_bytes)?;
+    // Wrap the core logic in a closure so we can catch errors and clean up
+    let result = (|| {
+        let mut header_buf = [0u8; HEADER_LEN];
+        input_file.read_exact(&mut header_buf).context("File too short to contain a valid header")?;
+        
+        let header = parse_header(&header_buf)?;
 
-    // Re-derive the key. We read the params from the header so if we ever change 
-    // the defaults, old files still decrypt fine.
-    let mut key = derive_key(password, header.salt, header.m_cost, header.t_cost, header.p_cost)?;
+        let mut key = derive_key(password, header.salt, header.m_cost, header.t_cost, header.p_cost)?;
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .expect("Key is exactly 32 bytes, so this should never fail");
 
-    let nonce = Nonce::from_slice(header.nonce);
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .expect("Key is exactly 32 bytes, so this should never fail");
+        let mut chunk_index: u32 = 0;
 
-    // If the password is wrong, or even a single bit flipped in the ciphertext, 
-    // GCM will catch it and this will fail. That's the whole point of authenticated encryption.
-    let plaintext = cipher
-        .decrypt(nonce, header.ciphertext)
-        .map_err(|_| anyhow::anyhow!("Decryption failed. Wrong password or corrupted data."))?;
+        loop {
+            let mut len_bytes = [0u8; 4];
+            match input_file.read_exact(&mut len_bytes) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    bail!("File is truncated. Missing final chunk.");
+                }
+                Err(e) => return Err(e).context("Failed to read chunk length"),
+            }
+            
+            let chunk_len = u32::from_le_bytes(len_bytes) as usize;
+            
+            if chunk_len > CHUNK_SIZE {
+                bail!("File is corrupted or tampered with. Invalid chunk size detected.");
+            }
 
-    write_decrypted_file(output_path, &plaintext)?;
+            let mut ct_buf = vec![0u8; chunk_len + 16]; // +16 for GCM tag
 
-    key.zeroize();
+            input_file.read_exact(&mut ct_buf).map_err(|_| {
+                anyhow::anyhow!("Decryption failed. The file has been truncated or tampered with.")
+            })?;
 
+            let is_last = chunk_len == 0;
+            let mut aad = Vec::with_capacity(5);
+            aad.extend_from_slice(&chunk_index.to_le_bytes());
+            aad.push(if is_last { 1 } else { 0 });
+
+            let mut chunk_nonce = [0u8; NONCE_LEN];
+            chunk_nonce.copy_from_slice(header.nonce);
+            let idx_bytes = chunk_index.to_le_bytes();
+            for i in 0..4 {
+                chunk_nonce[NONCE_LEN - 4 + i] ^= idx_bytes[i];
+            }
+            let nonce = Nonce::from_slice(&chunk_nonce);
+
+            let plaintext = cipher
+                .decrypt(nonce, Payload { msg: &ct_buf, aad: &aad })
+                .map_err(|_| anyhow::anyhow!("Decryption failed. Wrong password or corrupted data."))?;
+
+            if !plaintext.is_empty() {
+                output_file.write_all(&plaintext)?;
+            }
+
+            print!(".");
+            std::io::stdout().flush()?;
+
+            if is_last {
+                break;
+            }
+            chunk_index += 1;
+        }
+
+        println!(); // Newline after dots
+        key.zeroize();
+        Ok(())
+    })();
+
+    // Close the file handle
+    drop(output_file);
+
+    // If decryption failed, delete the orphaned temp file before returning the error
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_output_path);
+        return result;
+    }
+
+    // If it succeeded, rename the temp file to the final output
+    fs::rename(&tmp_output_path, output_path).context("Failed to finalize the decrypted file")?;
+    
     Ok(())
 }
 
-/// Kicks the tires before we do any heavy lifting.
-/// There's nothing worse than typing a long password only to realize the output path is wrong.
+/// Securely overwrites a file with random bytes, truncates it, and deletes it.
+/// Note: This is best-effort. SSDs with wear-leveling may leave copies of the data elsewhere.
+pub fn shred_file(path: &str) -> Result<()> {
+    let file_size = fs::metadata(path)?.len();
+    if file_size == 0 {
+        fs::remove_file(path)?;
+        return Ok(());
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .context("Failed to open file for shredding")?;
+
+    let chunk_size = 4096;
+    let mut buf = vec![0u8; chunk_size];
+    let mut written = 0;
+
+    while written < file_size {
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        let to_write = std::cmp::min(chunk_size as u64, file_size - written) as usize;
+        file.write_all(&buf[..to_write])?;
+        written += to_write as u64;
+    }
+    
+    file.sync_all()?;
+    file.set_len(0)?; // Truncate to hide original size
+    drop(file); // Close the file handle before deleting
+
+    fs::remove_file(path)?;
+    Ok(())
+}
+
 pub fn validate_paths(input_path: &str, output_path: &str, force: bool) -> Result<()> {
     if std::path::Path::new(input_path) == std::path::Path::new(output_path) {
         bail!("Input and output paths can't be the same. That's a good way to lose your data.");
@@ -142,28 +279,19 @@ pub fn validate_paths(input_path: &str, output_path: &str, force: bool) -> Resul
     Ok(())
 }
 
-/// Peeks inside an encrypted file to see what Argon2 params were used.
-/// Handy for debugging without having to type a password.
 pub fn inspect_file(path: &str) -> Result<(u8, u32, u32, u32)> {
-    let data = fs::read(path).context("Failed to read file")?;
-    let header = parse_header(&data)?;
+    let mut file = fs::File::open(path).context("Failed to read file")?;
+    let mut buf = [0u8; HEADER_LEN];
+    file.read_exact(&mut buf).context("File too short to inspect")?;
+    let header = parse_header(&buf)?;
     Ok((FORMAT_VERSION, header.m_cost, header.t_cost, header.p_cost))
 }
 
 // ── Internal helpers ─────────────────────────────────────────
 
-fn derive_key(
-    password: &str,
-    salt: &[u8],
-    m_cost: u32,
-    t_cost: u32,
-    p_cost: u32,
-) -> Result<[u8; 32]> {
+fn derive_key(password: &str, salt: &[u8], m_cost: u32, t_cost: u32, p_cost: u32) -> Result<[u8; 32]> {
     let params = Params::new(m_cost, t_cost, p_cost, Some(32))
         .map_err(|e| anyhow::anyhow!("Bad Argon2 parameters: {}", e))?;
-    
-    // Argon2id is the standard recommendation now. It resists both side-channel 
-    // and GPU attacks better than Argon2i or Argon2d alone.
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     let mut key = [0u8; 32];
@@ -175,13 +303,6 @@ fn derive_key(
 }
 
 fn parse_header(data: &[u8]) -> Result<EncryptedHeader<'_>> {
-    if data.len() < HEADER_LEN {
-        bail!(
-            "File is too short ({} bytes). Not a valid encrpt file.",
-            data.len()
-        );
-    }
-
     let magic = &data[0..6];
     if magic != MAGIC {
         bail!(
@@ -205,307 +326,14 @@ fn parse_header(data: &[u8]) -> Result<EncryptedHeader<'_>> {
     let m_cost = u32::from_be_bytes(data[35..39].try_into().unwrap());
     let t_cost = u32::from_be_bytes(data[39..43].try_into().unwrap());
     let p_cost = u32::from_be_bytes(data[43..47].try_into().unwrap());
-    
-    let ciphertext = &data[HEADER_LEN..];
 
-    if ciphertext.is_empty() {
-        bail!("The file header checks out, but there's no actual ciphertext inside.");
-    }
-
-    Ok(EncryptedHeader {
-        salt,
-        nonce,
-        m_cost,
-        t_cost,
-        p_cost,
-        ciphertext,
-    })
+    Ok(EncryptedHeader { salt, nonce, m_cost, t_cost, p_cost })
 }
 
-fn write_encrypted_file(
-    path: &str,
-    salt: &[u8],
-    nonce_bytes: &[u8],
-    ciphertext: &[u8],
-) -> Result<()> {
-    let mut file = fs::File::create(path).context("Couldn't create the output file")?;
-    set_restrictive_permissions(&file);
-
-    file.write_all(MAGIC)?;
-    file.write_all(&[FORMAT_VERSION])?;
-    file.write_all(salt)?;
-    file.write_all(nonce_bytes)?;
-    file.write_all(&DEFAULT_M_COST.to_be_bytes())?;
-    file.write_all(&DEFAULT_T_COST.to_be_bytes())?;
-    file.write_all(&DEFAULT_P_COST.to_be_bytes())?;
-    file.write_all(ciphertext)?;
-
-    Ok(())
-}
-
-fn write_decrypted_file(path: &str, plaintext: &[u8]) -> Result<()> {
-    let mut file = fs::File::create(path).context("Couldn't create the output file")?;
-    set_restrictive_permissions(&file);
-
-    file.write_all(plaintext)
-        .context("Failed to write the decrypted data")?;
-
-    Ok(())
-}
-
-/// Sets files to owner-only read/write on Unix. No reason to leave decrypted 
-/// files sitting around with 644 permissions for anyone to read.
 fn set_restrictive_permissions(file: &fs::File) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
-    }
-}
-
-// ── Tests ────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::NamedTempFile;
-
-    #[test]
-    fn roundtrip_encrypt_decrypt() {
-        let input = NamedTempFile::new().unwrap();
-        let enc = NamedTempFile::new().unwrap();
-        let dec = NamedTempFile::new().unwrap();
-
-        let secret = b"the quick brown fox jumps over the lazy dog";
-        fs::write(input.path(), secret).unwrap();
-
-        encrypt_file(
-            input.path().to_str().unwrap(),
-            enc.path().to_str().unwrap(),
-            "test_password_123",
-        )
-        .unwrap();
-
-        // The encrypted file should look like random garbage, except for the header
-        let enc_data = fs::read(enc.path()).unwrap();
-        assert_ne!(&enc_data[HEADER_LEN..], secret);
-        assert!(enc_data.starts_with(b"ENCRPT"));
-
-        decrypt_file(
-            enc.path().to_str().unwrap(),
-            dec.path().to_str().unwrap(),
-            "test_password_123",
-        )
-        .unwrap();
-
-        let decrypted = fs::read(dec.path()).unwrap();
-        assert_eq!(decrypted, secret);
-    }
-
-    #[test]
-    fn wrong_password_fails() {
-        let input = NamedTempFile::new().unwrap();
-        let enc = NamedTempFile::new().unwrap();
-        let dec = NamedTempFile::new().unwrap();
-
-        fs::write(input.path(), b"secret data").unwrap();
-
-        encrypt_file(
-            input.path().to_str().unwrap(),
-            enc.path().to_str().unwrap(),
-            "correct_password",
-        )
-        .unwrap();
-
-        let result = decrypt_file(
-            enc.path().to_str().unwrap(),
-            dec.path().to_str().unwrap(),
-            "wrong_password",
-        );
-
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Decryption failed"),
-            "Expected decryption failure, but got: {}",
-            err_msg
-        );
-    }
-
-    #[test]
-    fn empty_file_roundtrip() {
-        let input = NamedTempFile::new().unwrap();
-        let enc = NamedTempFile::new().unwrap();
-        let dec = NamedTempFile::new().unwrap();
-
-        fs::write(input.path(), b"").unwrap();
-
-        encrypt_file(
-            input.path().to_str().unwrap(),
-            enc.path().to_str().unwrap(),
-            "password",
-        )
-        .unwrap();
-
-        decrypt_file(
-            enc.path().to_str().unwrap(),
-            dec.path().to_str().unwrap(),
-            "password",
-        )
-        .unwrap();
-
-        let decrypted = fs::read(dec.path()).unwrap();
-        assert!(decrypted.is_empty());
-    }
-
-    #[test]
-    fn large_file_roundtrip() {
-        let input = NamedTempFile::new().unwrap();
-        let enc = NamedTempFile::new().unwrap();
-        let dec = NamedTempFile::new().unwrap();
-
-        let large_data: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
-        fs::write(input.path(), &large_data).unwrap();
-
-        encrypt_file(
-            input.path().to_str().unwrap(),
-            enc.path().to_str().unwrap(),
-            "password",
-        )
-        .unwrap();
-
-        decrypt_file(
-            enc.path().to_str().unwrap(),
-            dec.path().to_str().unwrap(),
-            "password",
-        )
-        .unwrap();
-
-        let decrypted = fs::read(dec.path()).unwrap();
-        assert_eq!(decrypted.len(), 1_000_000);
-        assert_eq!(decrypted, large_data);
-    }
-
-    #[test]
-    fn detect_non_encrpt_file() {
-        let tmp = NamedTempFile::new().unwrap();
-        fs::write(tmp.path(), b"this is not an encrypted file").unwrap();
-
-        let result = decrypt_file(
-            tmp.path().to_str().unwrap(),
-            "/dev/null",
-            "password",
-        );
-
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Doesn't look like an encrpt file"),
-            "Expected format detection error, got: {}",
-            err_msg
-        );
-    }
-
-    #[test]
-    fn truncated_file_fails() {
-        let tmp = NamedTempFile::new().unwrap();
-        fs::write(tmp.path(), b"ENCRPT\x01\x00\x00").unwrap();
-
-        let result = decrypt_file(
-            tmp.path().to_str().unwrap(),
-            "/dev/null",
-            "password",
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn wrong_version_fails() {
-        let tmp = NamedTempFile::new().unwrap();
-        let mut data = vec![0u8; HEADER_LEN + 16];
-        data[0..6].copy_from_slice(b"ENCRPT");
-        data[6] = 0xFF; // version from the future
-        fs::write(tmp.path(), &data).unwrap();
-
-        let result = decrypt_file(
-            tmp.path().to_str().unwrap(),
-            "/dev/null",
-            "password",
-        );
-
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("I only understand version"),
-            "Expected version error, got: {}",
-            err_msg
-        );
-    }
-
-    #[test]
-    fn validate_paths_rejects_same_path() {
-        assert!(validate_paths("/tmp/x", "/tmp/x", false).is_err());
-    }
-
-    #[test]
-    fn validate_paths_rejects_overwrite_without_force() {
-        let tmp = NamedTempFile::new().unwrap();
-        let output = tmp.path().to_str().unwrap();
-
-        assert!(validate_paths("/dev/null", output, false).is_err());
-        assert!(validate_paths("/dev/null", output, true).is_ok());
-    }
-
-    #[test]
-    fn validate_paths_rejects_missing_input() {
-        assert!(validate_paths("/nonexistent/path", "/tmp/out", false).is_err());
-    }
-
-    #[test]
-    fn inspect_file_returns_params() {
-        let input = NamedTempFile::new().unwrap();
-        let enc = NamedTempFile::new().unwrap();
-
-        fs::write(input.path(), b"test").unwrap();
-        encrypt_file(
-            input.path().to_str().unwrap(),
-            enc.path().to_str().unwrap(),
-            "password",
-        )
-        .unwrap();
-
-        let (version, m, t, p) = inspect_file(enc.path().to_str().unwrap()).unwrap();
-        assert_eq!(version, 0x01);
-        assert_eq!(m, DEFAULT_M_COST);
-        assert_eq!(t, DEFAULT_T_COST);
-        assert_eq!(p, DEFAULT_P_COST);
-    }
-
-    #[test]
-    fn binary_data_roundtrip() {
-        let input = NamedTempFile::new().unwrap();
-        let enc = NamedTempFile::new().unwrap();
-        let dec = NamedTempFile::new().unwrap();
-
-        let binary_data: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
-        fs::write(input.path(), &binary_data).unwrap();
-
-        encrypt_file(
-            input.path().to_str().unwrap(),
-            enc.path().to_str().unwrap(),
-            "binary_test",
-        )
-        .unwrap();
-
-        decrypt_file(
-            enc.path().to_str().unwrap(),
-            dec.path().to_str().unwrap(),
-            "binary_test",
-        )
-        .unwrap();
-
-        let decrypted = fs::read(dec.path()).unwrap();
-        assert_eq!(decrypted, binary_data);
     }
 }

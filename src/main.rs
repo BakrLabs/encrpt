@@ -4,9 +4,6 @@ use clap::{Parser, Subcommand};
 mod crypto;
 
 /// A no-nonsense file encryption tool.
-/// 
-/// Uses AES-256-GCM so the bad guys can't read or tamper with your files,
-/// and Argon2id so brute-forcing your password takes forever.
 #[derive(Parser)]
 #[command(
     name = "encrpt",
@@ -15,6 +12,7 @@ mod crypto;
     long_about = r#"A no-nonsense file encryption tool.
 
 Uses AES-256-GCM for authenticated encryption and Argon2id for key derivation.
+Supports streaming encryption for massive files and optional secure shredding.
 
 USAGE:
   # Lock a file:
@@ -35,37 +33,35 @@ struct Cli {
 enum Commands {
     /// Encrypt a file. You'll be asked for a password twice to prevent typos.
     Encrypt {
-        /// The file you want to encrypt
         #[arg(short, long)]
         input: String,
 
-        /// Where to save the encrypted file
         #[arg(short, long)]
         output: String,
 
         /// Overwrite the output file if it already exists
         #[arg(short, long)]
         force: bool,
+
+        /// Securely delete the original plaintext file after encryption
+        #[arg(long)]
+        shred: bool,
     },
 
     /// Decrypt a file. If the password is wrong, or the file was tampered with, it will fail.
     Decrypt {
-        /// The file you want to decrypt
         #[arg(short, long)]
         input: String,
 
-        /// Where to save the decrypted file
         #[arg(short, long)]
         output: String,
 
-        /// Overwrite the output file if it already exists
         #[arg(short, long)]
         force: bool,
     },
 
     /// Peek inside an encrypted file to check its settings (doesn't need a password).
     Inspect {
-        /// The encrypted file to inspect
         #[arg(short, long)]
         input: String,
     },
@@ -79,8 +75,8 @@ fn main() -> Result<()> {
             input,
             output,
             force,
+            shred,
         } => {
-            // Check paths first so we don't waste time typing a password if it's going to fail
             crypto::validate_paths(&input, &output, force)?;
 
             let password = rpassword::prompt_password("Enter password: ")?;
@@ -90,7 +86,13 @@ fn main() -> Result<()> {
                 anyhow::bail!("Typo? The passwords didn't match.");
             }
 
+            println!("Encrypting...");
             crypto::encrypt_file(&input, &output, &password)?;
+
+            if shred {
+                println!("Shredding original file...");
+                crypto::shred_file(&input)?;
+            }
 
             println!("✅ Locked and loaded: {}", output);
         }
@@ -104,6 +106,7 @@ fn main() -> Result<()> {
 
             let password = rpassword::prompt_password("Enter password: ")?;
 
+            println!("Decrypting...");
             crypto::decrypt_file(&input, &output, &password)?;
 
             println!("✅ Unlocked: {}", output);
