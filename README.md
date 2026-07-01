@@ -14,6 +14,8 @@ Sometimes you just need to encrypt a file from the terminal without setting up a
 
 - **AES-256-GCM**: Encrypts your data *and* checks that nobody tampered with it. If a single bit changes in the encrypted file, decryption fails.
 - **Argon2id**: The current gold standard for turning passwords into keys. It's deliberately slow and memory-hard, making brute-force attacks incredibly expensive.
+- **Streaming I/O**: Files are encrypted in 64KB chunks. You can encrypt a 100GB video on a laptop with 4GB of RAM without crashing.
+- **Atomic Writes**: Writes to a temporary file first. If decryption fails halfway through (e.g., wrong password), your original output file is never destroyed.
 - **Zeroize**: Keys are wiped from memory the moment they're no longer needed.
 - **Self-describing format**: The encryption parameters are saved inside the file. If you ever update the defaults, old files will still decrypt fine.
 - **No footguns**: Refuses to overwrite files unless you use `--force`. Validates paths before asking for passwords.
@@ -27,7 +29,6 @@ git clone https://github.com/BakrLabs/encrpt.git
 cd encrpt
 cargo install --path .
 ```
-
 ## How to use it
 
 ### Lock a file:
@@ -51,6 +52,13 @@ encrpt inspect -i secret.enc
 ```
 Shows you the format version and the Argon2 parameters used, no password required.
 
+### Securely delete the original file after encryption:
+
+```bash
+encrpt encrypt -i secret.txt -o secret.enc --shred
+```
+Overwrites the plaintext file with random bytes, truncates it, and deletes it.
+
 ### Overwrite an existing file:
 
 ```bash
@@ -70,3 +78,5 @@ Note: Because the Argon2 parameters are baked into the header, you can safely ch
 - Memory safety. Rust prevents whole classes of vulnerabilities (buffer overflows, use-after-free) that have plagued C crypto tools for decades.
 
 - File permissions. On Unix systems, output files are created with 0600 (owner read/write only). No more accidentally leaving your decrypted files world-readable.
+
+- SSD Shredding. The ``` --shred ``` command is best-effort. On traditional HDDs, it completely destroys the data. On SSDs (due to wear-leveling), there is no way to guarantee physical overwriting from userspace, but it still prevents the file from being recovered through standard filesystem APIs.
