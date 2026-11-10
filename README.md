@@ -84,7 +84,7 @@ The encrypted file is just a fixed 47-byte header followed by encrypted chunks. 
 ## Security Notes
 - Don't forget your password. There is no recovery mechanism. If you lose it, the data is gone.
 
-- This is not a backup tool. It encrypts files in-place/duplicates them. Make sure you keep backups.
+- This is not a backup tool. It writes a new encrypted file and leaves the original in place unless you use `` --shred ``Keep backups, and don't delete the only copy of anything until you've confirmed it decrypts.
 
 - Memory safety. Rust prevents whole classes of vulnerabilities (buffer overflows, use-after-free) that have plagued C crypto tools for decades.
 
